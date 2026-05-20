@@ -2,7 +2,11 @@ import asyncio
 import logging
 import os
 import re
+import sys
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import Optional, Tuple
 
 import yt_dlp
@@ -10,26 +14,49 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls
 
-# ----------------- CONFIG -----------------
+# ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-STRING_SESSION = os.getenv("STRING_SESSION", "")
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 BOT_NAME = os.getenv("BOT_NAME", "Elite VC Music Bot")
 
-# cookies.txt in repo root by default
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
-COOKIE_PATH = Path(COOKIES_FILE)
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
+COOKIE_PATHS = [
+    Path(COOKIES_FILE),
+    Path("/etc/secrets/cookies.txt"),
+]
 
-# ----------------- LOGGING -----------------
+PORT = int(os.getenv("PORT", "10000"))
+
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("vc-music-bot")
 
-# ----------------- VALIDATION -----------------
+# ---------------- HTTP SERVER FOR RENDER ----------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+Thread(target=run_web_server, daemon=True).start()
+
+# ---------------- VALIDATION ----------------
 missing = []
 if not API_ID:
     missing.append("API_ID")
@@ -43,7 +70,7 @@ if not STRING_SESSION:
 if missing:
     raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
-# ----------------- CLIENTS -----------------
+# ---------------- CLIENTS ----------------
 bot = Client(
     "music_bot",
     api_id=API_ID,
@@ -60,13 +87,11 @@ user = Client(
 
 music = PyTgCalls(user)
 
-# ----------------- HELPERS -----------------
+# ---------------- HELPERS ----------------
 URL_RE = re.compile(r"^https?://", re.I)
-
 
 def is_url(text: str) -> bool:
     return bool(URL_RE.match(text.strip()))
-
 
 def fmt_time(seconds: Optional[int]) -> str:
     if not seconds:
@@ -74,16 +99,15 @@ def fmt_time(seconds: Optional[int]) -> str:
     seconds = int(seconds)
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+def cookiefile_path() -> Optional[str]:
+    for p in COOKIE_PATHS:
+        if p.exists() and p.is_file():
+            return str(p)
+    return None
 
 def extract_stream(query: str) -> Tuple[str, str, str, Optional[int]]:
-    """
-    Returns:
-        stream_url, title, webpage_url, duration
-    """
     source = query.strip() if is_url(query) else f"ytsearch1:{query.strip()}"
 
     ydl_opts = {
@@ -98,8 +122,9 @@ def extract_stream(query: str) -> Tuple[str, str, str, Optional[int]]:
         "fragment_retries": 3,
     }
 
-    if COOKIE_PATH.exists():
-        ydl_opts["cookiefile"] = str(COOKIE_PATH)
+    cfile = cookiefile_path()
+    if cfile:
+        ydl_opts["cookiefile"] = cfile
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(source, download=False)
@@ -113,22 +138,24 @@ def extract_stream(query: str) -> Tuple[str, str, str, Optional[int]]:
     title = info.get("title", "Unknown")
     webpage_url = info.get("webpage_url", query)
     duration = info.get("duration")
-
     return stream_url, title, webpage_url, duration
 
+async def maybe_async(func, *args, **kwargs):
+    result = func(*args, **kwargs)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
 
 async def get_query(message: Message) -> Optional[str]:
     if len(message.command) < 2:
         return None
     return " ".join(message.command[1:]).strip()
 
-
 async def ensure_group(message: Message) -> bool:
     if message.chat.type not in ("group", "supergroup"):
-        await message.reply_text("This command works only in group voice chats.")
+        await message.reply_text("This command works only inside a group or supergroup.")
         return False
     return True
-
 
 async def safe_edit(msg: Message, text: str):
     try:
@@ -136,8 +163,7 @@ async def safe_edit(msg: Message, text: str):
     except Exception:
         pass
 
-
-# ----------------- COMMANDS -----------------
+# ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start_cmd(_: Client, message: Message):
     await message.reply_text(
@@ -151,14 +177,12 @@ async def start_cmd(_: Client, message: Message):
         "/ping"
     )
 
-
 @bot.on_message(filters.command("ping"))
 async def ping_cmd(_: Client, message: Message):
     start = asyncio.get_event_loop().time()
     m = await message.reply_text("Pinging...")
     end = asyncio.get_event_loop().time()
     await m.edit_text(f"Pong! `{int((end - start) * 1000)} ms`")
-
 
 @bot.on_message(filters.command("play"))
 async def play_cmd(_: Client, message: Message):
@@ -179,12 +203,12 @@ async def play_cmd(_: Client, message: Message):
 
         await safe_edit(
             status,
-            f"Playing now...\n\n"
+            f"Joining and playing...\n\n"
             f"**Title:** {title}\n"
             f"**Duration:** {fmt_time(duration)}",
         )
 
-        await asyncio.to_thread(music.play, message.chat.id, stream_url)
+        await maybe_async(music.play, message.chat.id, stream_url)
 
         await safe_edit(
             status,
@@ -195,70 +219,71 @@ async def play_cmd(_: Client, message: Message):
         )
 
     except Exception as e:
-        log.exception("Play error")
+        log.exception("Play failed")
         await safe_edit(status, f"Play failed.\n\n`{e}`")
-
 
 @bot.on_message(filters.command("pause"))
 async def pause_cmd(_: Client, message: Message):
     if not await ensure_group(message):
         return
     try:
-        await asyncio.to_thread(music.pause, message.chat.id)
+        await maybe_async(music.pause, message.chat.id)
         await message.reply_text("Paused.")
     except Exception as e:
         await message.reply_text(f"Pause failed: `{e}`")
-
 
 @bot.on_message(filters.command("resume"))
 async def resume_cmd(_: Client, message: Message):
     if not await ensure_group(message):
         return
     try:
-        await asyncio.to_thread(music.resume, message.chat.id)
+        await maybe_async(music.resume, message.chat.id)
         await message.reply_text("Resumed.")
     except Exception as e:
         await message.reply_text(f"Resume failed: `{e}`")
-
 
 @bot.on_message(filters.command("stop"))
 async def stop_cmd(_: Client, message: Message):
     if not await ensure_group(message):
         return
     try:
-        await asyncio.to_thread(music.stop, message.chat.id)
+        await maybe_async(music.stop, message.chat.id)
         await message.reply_text("Stopped.")
     except Exception as e:
         await message.reply_text(f"Stop failed: `{e}`")
-
 
 @bot.on_message(filters.command("leave"))
 async def leave_cmd(_: Client, message: Message):
     if not await ensure_group(message):
         return
     try:
-        await asyncio.to_thread(music.leave, message.chat.id)
+        await maybe_async(music.leave, message.chat.id)
         await message.reply_text("Left voice chat.")
     except Exception as e:
         await message.reply_text(f"Leave failed: `{e}`")
 
-
-# ----------------- MAIN -----------------
+# ---------------- MAIN ----------------
 async def main():
-    await user.start()
-    await bot.start()
-    music.start()
+    try:
+        await user.start()
+        await bot.start()
+        await maybe_async(music.start)
 
-    me = await bot.get_me()
-    log.info("Bot started as @%s", me.username or "unknown")
-    print("Bot is running...")
+        me = await bot.get_me()
+        log.info("Bot started as @%s", me.username or "unknown")
+        print("Bot is running...")
 
-    # Keep process alive
-    await asyncio.Event().wait()
+        await asyncio.Event().wait()
 
+    except Exception:
+        traceback.print_exc()
+        raise
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped.")
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
